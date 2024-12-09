@@ -126,7 +126,9 @@ def run_awq(
     # patch layer 0 to catch input and kwargs
     layers[0] = Catcher(layers[0])
     try:
-        model(samples.to(next(model.parameters()).device))
+        # model(samples.to(next(model.parameters()).device))
+        device = next(model.parameters()).device
+        model(samples.to(device))
     except ValueError:  # work with early exit
         pass
     del samples

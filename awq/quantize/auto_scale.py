@@ -23,6 +23,15 @@ def get_weight_scale(weight, q_group_size=-1):
     scale = scale.mean(0)
     return scale
 
+@torch.no_grad()
+def get_weight_mean(linears2scale: list):
+    scales = []
+    for fc in linears2scale:
+        scales.append(fc.weight.abs().mean(0))
+    # get the mean of all scales
+    scales = torch.cat(scales, 0)
+    return scales.mean(0)
+
 
 @torch.no_grad()
 def get_act_scale(x):
@@ -115,40 +124,70 @@ def auto_scale_block(module, module_kwargs, w_bit, q_config, input_feat):
                 org_out = org_out[0]
 
         x_max = get_act_scale(x)
+        w_max = get_weight_mean(linears2scale)
+        # print the mean of x_max and w_max and variance
+        print("x_max: ", x_max.mean(), x_max.var())
+        print("w_max: ", w_max.mean(), w_max.var())
+        print(x_max.shape, w_max.shape)
 
         best_error = float("inf")
         best_ratio = -1
         best_scales = None
 
-        n_grid = 20
+        n_grid = 10
+        w_grid = 10
+        linear_grid = 6
+        best_params = None
         history = []
 
         org_sd = {k: v.cpu() for k, v in block.state_dict().items()}
         for ratio in range(n_grid):
             ratio = ratio * 1 / n_grid
-            scales = x_max.pow(ratio).clamp(min=1e-4).view(-1)
-            scales = scales / (scales.max() * scales.min()).sqrt()
-            for fc in linears2scale:
-                fc.weight.mul_(scales.view(1, -1).to(fc.weight.device))
-                fc.weight.data = w_quantize_func(fc.weight.data) / (scales.view(1, -1))
-            out = block(x, **kwargs)
-            if isinstance(out, tuple):
-                out = out[0]
+            for w_ratio in range(w_grid):
+                w_ratio = w_ratio * 1 / w_grid
+                for a in range(linear_grid+1):
+                    a = a * 1.0 / linear_grid # 0, .., 1.0
+                    scales = a * x_max.pow(ratio).clamp(min=1e-4).view(-1)
+                    scales += (1 - a) * w_max.pow(w_ratio).clamp(min=1e-4).view(-1)
+                    scales = scales / (scales.max() * scales.min()).sqrt()
+                    
+                    fc = linears2scale[0]
+                    # weight shape: co, ci
+                    weight = fc.weight.data.t()
+                    # m shape: co, ci
+                    m = w_quantize_func(weight * scales.view(1, -1).to(fc.weight.device)) / (scales.view(1, -1))
+                    # dot product of weight and m, should be same shape as scales
+                    numerator = (weight * m).sum(1)
+                    # dot product of weight and weight
+                    denominator = (weight * weight).sum(1)
+                    # scales = (numerator / denominator).t() if denominator != 0 else scales
+                    print(scales.shape, weight.shape, m.shape, numerator.shape, denominator.shape)
+                    scales = torch.where(denominator != 0, (numerator / denominator).t(), scales)
 
-            loss = (
-                (org_out - out).float().pow(2).mean().item()
-            )  # float prevents overflow
-            history.append(loss)
-            is_best = loss < best_error
-            if is_best:
-                best_error = loss
-                best_ratio = ratio
-                best_scales = scales
-            block.load_state_dict(org_sd)
+                    for fc in linears2scale:
+                        fc.weight.mul_(scales.view(1, -1).to(fc.weight.device))
+                        fc.weight.data = w_quantize_func(fc.weight.data) / (scales.view(1, -1))
+                    
+                    out = block(x, **kwargs)
+                    if isinstance(out, tuple):
+                        out = out[0]
+
+                    loss = (
+                        (org_out - out).float().pow(2).mean().item()
+                    )  # float prevents overflow
+                    history.append(loss)
+                    is_best = loss < best_error
+                    if is_best:
+                        best_error = loss
+                        best_ratio = ratio
+                        best_scales = scales
+                        best_params = (ratio, w_ratio, a)
+                    block.load_state_dict(org_sd)
         if best_ratio == -1:
             print(history)
             raise Exception
         # print(best_ratio)
+        print("best param: ", best_params)
         best_scales = best_scales.view(-1)
 
         assert torch.isnan(best_scales).sum() == 0, best_scales

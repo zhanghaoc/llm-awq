@@ -187,6 +187,7 @@ def build_model_and_enc(model_path):
         if args.load_awq:
             print("Loading pre-computed AWQ results from", args.load_awq)
             awq_results = torch.load(args.load_awq, map_location="cpu")
+            print("awq result: ", awq_results["scale"])
             apply_awq(model, awq_results)
 
         # weight quantization
